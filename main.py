@@ -1,78 +1,207 @@
-import sys
 from burp import IBurpExtender
-from burp import IHttpListener
+from burp import IScannerCheck
 from burp import IScanIssue
-try:
-from urllib.parse import urlparse
-except ImportError:
-from urlparse import urlparse
+import array
+from urlparse import urlparse, unquote
+import re
 
-class BurpExtender(IBurpExtender, IHttpListener):
+
+class BurpExtender(IBurpExtender, IScannerCheck):
+
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
-            # set extension name
-    callbacks.setExtensionName("SSRF Vulnerability Scanner")
+        callbacks.setExtensionName("SSRF Scanner")
+        callbacks.registerScannerCheck(self)
 
-    # register an HTTP listener
-    callbacks.registerHttpListener(self)
+    def doPassiveScan(self, baseRequestResponse):
+        try:
+            requestInfo = self._helpers.analyzeRequest(baseRequestResponse)
+            headers = requestInfo.getHeaders()
+            requestBody = baseRequestResponse.getRequest()[requestInfo.getBodyOffset():]
+            url = self._helpers.analyzeRequest(baseRequestResponse).getUrl()
+            parsedUrl = urlparse(str(url))
 
-    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        if not messageIsRequest:
-            return
+            # Check if the URL scheme is http or https
+            if not parsedUrl.scheme in ["http", "https"]:
+                return None
 
-        # get the request
-        request = messageInfo.getRequest()
-        requestInfo = self._helpers.analyzeRequest(request)
+            # Extract the parameters from the request
+            parameters = requestInfo.getParametersfor parameter in parameters:
+                paramValue = parameter.getValue()
+                # Check if the parameter value is a URL
+                if re.match("^http[s]?", paramValue):
+                    # Decode the URL
+                    paramValue = unquote(paramValue)
 
-        # check for SSRF vulnerability and if found, add a scan issue
-        if self.checkForSSRF(requestInfo):
-            self._callbacks.addScanIssue(IScanIssue(
-                messageInfo.getHttpService(),
-                requestInfo.getUrl(),
-                [self._callbacks.getScanIssues("SSRF Vulnerability")],
-                "SSRF Vulnerability",
-                "The request is vulnerable to SSRF",
-                "High",
-                "Certain"))
+                    # Create a new URL with the parameter value
+                    newUrl = urlparse(paramValue)
 
-    def checkForSSRF(self, requestInfo):
-        host = requestInfo.getUrl().getHost()
-        parsed_host = urlparse(host).hostname
+                    if not newUrl.scheme or not newUrl.hostname:
+                        print("some prob")
+                        continue
 
-        # check if the host is '127.0.0.1' or 'localhost'
-        if parsed_host == "127.0.0.1" or parsed_host == "localhost":
-            return True
+                    # Check if the host of the new URL is the same as the host of the original URL
+                    if newUrl.hostname != parsedUrl.hostname:
+                        # Send a request to the new URL and check if the response is successful
+                        checkRequest = self._helpers.buildHttpRequest(requestInfo.getUrl())
 
-        # check if the host is a private IP
-        if self.checkForPrivateIP(parsed_host):
-            return True
+                        malUrlhostname = "localhost/admin"
+                        malUrlport = 443
 
-        # check if the host is a reserved IP
-        if self.checkForReservedIP(parsed_host):
-            return True
+                        checkRequest = checkRequest.replace(requestInfo.getUrl().toString(), "localhost/admin")
+                        checkResponse = self._callbacks.makeHttpRequest(malUrlhostname, malUrlport, False,
+                                                                        checkRequest)
 
-        # check if the host is an internal hostname
-        if self.checkForInternalHostname(parsed_host):
-            return True
 
-        return False
+                        if checkResponse.getStatusCode() < 400:
 
-    def checkForPrivateIP(self, host):
-        # check if the host is a private IP
-        if host.startswith("10.") or host.startswith("172.") or host.startswith("192.168."):
-            return True
-        return False
+                            issue = ScanIssue(
+                                baseRequestResponse.getHttpService(),
+                                self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
+                                [self._callbacks.applyMarkers(baseRequestResponse, None,
+                                                              [parameter.getNameStart(), parameter.getNameEnd(),
+                                                               parameter.getValueStart(), parameter.getValueEnd()])],
+                                "SSRF Vulnerability",
+                                "The parameter " + parameter.getName() + " in " + requestInfo.getUrl().getPath() + " appears to be vulnerable to SSRF. The application was able to successfully make a request to an external URL.",
+                                "High"
+                            )
+                            print("Potential SSRF vulnerabilities found in " + url.toString())
+                            return [issue]
+                        else: print("No potential SSRF vulnerabilities found in " + url.toString())
+        except Exception as e:
+            print(e)
+        return None
 
-    def checkForReservedIP(self, host):
-        # check if the host is a reserved IP
-        if host.startswith("0.") or host.startswith("169.254.") or host.startswith("192.0.0.") or host.startswith(
-                "198.18"):
-            return True
-        return False
+    def doActiveScan(self, baseRequestResponse, insertionPoint):
+        try:
+            requestInfo = self._helpers.analyzeRequest(baseRequestResponse)
+            headers = requestInfo.getHeaders()
+            requestBody = baseRequestResponse.getRequest()[requestInfo.getBodyOffset():]
+            url = self._helpers.analyzeRequest(baseRequestResponse).getUrl()
+            parsedUrl = urlparse(str(url))
 
-    def checkForInternalHostname(self, host):
-        # check if the host is an internal hostname
-        if host.endswith(".local") or host.endswith(".internal"):
-            return True
-        return False
+            # Check if the request is a GET or POST request
+            if not requestInfo.getMethod() in ["GET", "POST"]:
+                return None
+
+            # Check if the URL scheme is http or https
+            if not parsedUrl.scheme in ["http", "https"]:
+                return None
+
+            # Extract the parameters from the request
+            parameters = requestInfo.getParameters()
+
+            for parameter in parameters:
+                paramValue = parameter.getValue()
+
+                # Check if the parameter value is a URL
+                if re.match("^http[s]?", paramValue):
+                    #Decode the URL and extract the hostname
+                    paramValue = unquote(paramValue)
+                    newUrl = urlparse(paramValue)
+                    #print(newUrl)
+                    #print(newUrl.hostname)
+                    #print(newUrl.port)
+                    if not newUrl.scheme or not newUrl.hostname:
+                        print("some prob")
+                        continue
+                # Check if the host of the new URL is the same as the host of the original URL
+                    if newUrl.hostname != parsedUrl.hostname:
+                        # Send a request to the new URL and check if the response is successful
+                        checkRequest = self._helpers.buildHttpRequest(requestInfo.getUrl())
+
+                        malUrlhostname = "localhost/admin"
+                        malUrlport = 443
+                        checkRequest = checkRequest.replace(requestInfo.getUrl().toString(), "localhost/admin")
+
+                        checkResponse = self._callbacks.makeHttpRequest(malUrlhostname, malUrlport, False,
+                                                                        checkRequest)
+
+
+                        if checkResponse.getStatusCode() < 400:
+
+                            # Issue description
+                            description = "The parameter " + parameter.getName() + " in " + requestInfo.getUrl().getPath() + " appears to be vulnerable to SSRF. The application was able to successfully make a request to an external URL."
+
+                            # Issue severity
+                            severity = "High"
+
+                            # Issue name
+                            issueName = "SSRF Vulnerability"
+
+                            # Issue background
+                            issueBackground = "Server-Side Request Forgery (SSRF) is a vulnerability that occurs when an application allows an attacker to send requests from the server-side of the application to a destination specified by the attacker."
+
+                            # Issue detail
+                            issueDetail = "The parameter " + parameter.getName() + " in " + requestInfo.getUrl().getPath() + " appears to be vulnerable to SSRF. The application was able to successfully make a request to an external URL."
+
+                            # Create a ScanIssue object
+                            scanIssue = ScanIssue(
+                                baseRequestResponse.getHttpService(),
+                                self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
+                                [self._callbacks.applyMarkers(baseRequestResponse, None,
+                                                              [parameter.getNameStart(), parameter.getNameEnd(),
+                                                               parameter.getValueStart(), parameter.getValueEnd()])],
+                                issueName,
+                                issueDetail,
+                                severity
+                            )
+
+                            print("Potential SSRF vulnerabilities found in " + url.toString())
+                            self._callbacks.addScanIssue(scanIssue)
+                        else:print("No potential SSRF vulnerabilities found in " + url.toString())
+
+            return None
+        except Exception as e:
+            print(e)
+            return None
+
+    def consolidateDuplicateIssues(self, existingIssue, newIssue):
+        if existingIssue.getUrl() == newIssue.getUrl() and existingIssue.getIssueName() == newIssue.getIssueName() and existingIssue.getIssueDetail() == newIssue.getIssueDetail():
+            return -1
+        else:
+            return 0
+
+
+class ScanIssue(IScanIssue):
+    def __init__(self, httpService, url, httpMessages, name, detail, severity):
+        self._httpService = httpService
+        self._url = url
+        self._httpMessages = httpMessages
+        self._name = name
+        self._detail = detail
+        self._severity = severity
+
+    def getUrl(self):
+        return self._url
+
+    def getIssueName(self):
+        return self._name
+
+    def getIssueType(self):
+        return 0
+
+    def getSeverity(self):
+        return self._severity
+
+    def getConfidence(self):
+        return "Certain"
+
+    def getIssueBackground(self):
+        return None
+
+    def getRemediationBackground(self):
+        return None
+
+    def getIssueDetail(self):
+        return self._detail
+
+    def getRemediationDetail(self):
+        return None
+
+    def getHttpMessages(self):
+        return self._httpMessages
+
+    def getHttpService(self):
+        return self._httpService
